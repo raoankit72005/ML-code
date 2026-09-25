@@ -1,4 +1,4 @@
-"""Evaluate EXTERNALLY supplied probabilities; no model training or inference."""
+"""Evaluate model probabilities with per-Source-1 macro F0.5."""
 import csv
 import json
 import math

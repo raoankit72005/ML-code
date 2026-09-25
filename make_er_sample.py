@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make a small inspection ZIP for the Amazon business entity resolution task.
+"""Make a sampled baseline-development ZIP for the Amazon business entity resolution task.
 
 Python 3.9+, standard library only. Reads an extracted folder or a ZIP directly.
 Notebook: %run make_er_sample.py --input "student_resource.zip"
@@ -7,7 +7,10 @@ Terminal: python make_er_sample.py --input "student_resource.zip"
 
 The originals are read only. All known matches for sampled training entities
 are retained. Independently sampled test rows have NO completeness guarantee.
-Use this sample for inspection, not for estimating leaderboard performance.
+Defaults: 5,000 S1 rows per country, all their known matches, plus 5,000
+random distractors per country per reference source; 5,000 test rows per country
+per source. Useful for baseline training/debugging, not reliable leaderboard
+estimation. Sampled test files cannot produce a full challenge submission.
 """
 
 import argparse
@@ -138,7 +141,11 @@ def write_tsv(archive, path, columns, data):
 
 def package(source, destination, args):
     summary = {"seed": args.seed, "full_dataset": {}, "sample": {},
-               "purpose": "Inspection only; not a validation or submission dataset."}
+               "purpose": "Baseline development; sampled-pool validation is optimistic and test is incomplete.",
+               "sampling_config": {"train_per_country": args.train_per_country,
+                   "distractors_per_country": args.distractors_per_country,
+                   "test_per_country": args.test_per_country},
+               "sample_country_counts": {}}
     name = "train_source1.tsv"
     print(f"Scanning {name} ...", flush=True)
     reservoir = Reservoir(args.train_per_country, args.seed)
@@ -152,6 +159,10 @@ def package(source, destination, args):
         raise ValueError("Duplicate IDs in the selected training Source 1 records.")
     summary["full_dataset"][name] = profile.result()
     summary["sample"][name] = len(train_s1)
+    summary["sample_country_counts"][name] = dict(Counter(r["country"].strip() for r in train_s1))
+    for country, count in summary["sample_country_counts"][name].items():
+        if count < args.train_per_country:
+            print(f"Note: {country} has only {count:,} available S1 records; kept all.", flush=True)
 
     print("Scanning train_ground_truth.tsv ...", flush=True)
     truth = {}
@@ -243,7 +254,7 @@ def package(source, destination, args):
                 out.writestr(target, stream.read())
         out.writestr("dataset_summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
         out.writestr("SAMPLE_README.txt", (
-            "INSPECTION SAMPLE - Amazon Business Entity Resolution\n\n"
+            "BASELINE DEVELOPMENT SAMPLE - Amazon Business Entity Resolution\n\n"
             "Training: uniform random Source 1 sample within each country; ALL known S2/S3\n"
             "matches for selected S1 records are retained, plus random distractors.\n"
             "Countries are sampled separately, so the sample does not preserve country proportions.\n"
@@ -252,20 +263,26 @@ def package(source, destination, args):
             "Summary counts describe the FULL source files, not just the sample.\n"
             "Blank counts use empty/whitespace fields; literal NA/NULL strings are preserved.\n\n"
             "Use this ZIP for schema checks, examples, and developing the pipeline.\n"
-            "Do not use it for final training, leaderboard predictions, or reliable validation:\n"
-            "many difficult distractors have been removed. Train and evaluate on the full data.\n"
+            "You may train a quick baseline here, but validation is optimistic:\n"
+            "many difficult distractors have been removed. Evaluate retrieval against the full pool.\n"
+            "Sampled test outputs are not valid full challenge submissions.\n"
             "All original files were read only; this program performs no network requests.\n"))
     return summary
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="Dataset ZIP, or extracted folder containing train/test TSV files")
     parser.add_argument("--output", default="er_sample.zip", help="New ZIP to create (default: er_sample.zip)")
-    parser.add_argument("--train-per-country", type=int, default=250)
-    parser.add_argument("--distractors-per-country", type=int, default=250)
-    parser.add_argument("--test-per-country", type=int, default=100)
+    parser.add_argument("--train-per-country", type=int, default=5000, help="Records per country (default: 5000)")
+    parser.add_argument("--distractors-per-country", type=int, default=5000, help="Records per country (default: 5000)")
+    parser.add_argument("--test-per-country", type=int, default=5000, help="Test rows per country per source (default: 5000)")
     parser.add_argument("--seed", type=int, default=42)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if min(args.train_per_country, args.distractors_per_country, args.test_per_country) < 1:
         parser.error("Sample sizes must be positive integers.")
@@ -294,7 +311,7 @@ def main():
         source.close()
     print(f"\nCreated: {destination}")
     print(f"ZIP size: {destination.stat().st_size / (1024 * 1024):.2f} MiB")
-    print("Upload this ZIP to the chat. Keep the full dataset for training and evaluation.")
+    print("Use this ZIP for baseline development. Keep the full test dataset for actual submission.")
 
 
 if __name__ == "__main__":

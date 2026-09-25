@@ -1,112 +1,119 @@
-# Amazon ML Challenge 2026 — Business Entity Resolution
+# Amazon ML Challenge 2026 — Complete LightGBM Baseline
 
-This project connects your existing `clean_er_data.py` outputs to model-ready pair tables. **It contains no LightGBM training or model inference code.** After you train a model separately, the evaluation and submission modules accept its probabilities.
+**Sampling (optional) → cleaning → blocking → candidate pairs → ground-truth labels → pairwise features → train/validation tables → LightGBM → match probabilities → validation macro F₀.₅ threshold → final matches.**
 
-Pipeline:
+The repository includes CPU LightGBM training, batched inference, threshold selection, and submission formatting. No challenge datasets, model weights, passwords or generated outputs are committed.
 
-**Cleaned data → reference index → blocking → final candidate pairs → ground-truth labels → pairwise features → train/validation tables → [your model] → [your probabilities] → macro F₀.₅ / submission.**
+## 1. Install and create your 5,000 + 5,000 sample
 
-## 0. Clean the original dataset
-
-The repository includes all code built so far: optional sampling, cleaning, blocking,
-labeling, features, table export, and probability evaluation/submission formatting.
-LightGBM model training and inference are not yet implemented.
-
-Place `ML_Dataset.zip` locally beside `run.py`, then run:
+Use Python **3.11–3.13**. Open a terminal inside this repository:
 
 ```bash
-python clean_er_data.py --input "ML_Dataset.zip" --output "cleaned_data"
-```
-
-To optionally create a small debugging sample first:
-
-```bash
-python make_er_sample.py --input "ML_Dataset.zip" --output "er_sample.zip"
-python clean_er_data.py --input "er_sample.zip" --output "cleaned_sample"
-```
-
-Original datasets, labels, generated feature tables, credentials and model artifacts
-are excluded from Git. No challenge data is included in this repository.
-
-## 1. Setup
-
-Use Python **3.11–3.13**, preferably a fresh virtual environment. No GPU is required. SQLite must include FTS5; most standard Python builds do. An unavailable FTS5 extension produces `no such module: fts5` during indexing.
-
-Clone this repository and open a terminal **inside the repository folder**, where `run.py` is located. The commands assume cleaned data is generated inside that folder:
-
-```bash
+git pull
 python -m pip install -r requirements.txt
+python make_er_sample.py --input "ML_Dataset.zip" --output "er_sample_5000.zip"
 ```
 
-`--cleaned` expects the CLEANER OUTPUT FOLDER, not `ML_Dataset.zip`. Run the included cleaning script first. Files can be `.tsv.gz` or `.tsv`; exactly one version of each must exist.
+The new sampler defaults are:
 
-Required inputs:
+| Component | Records retained |
+|---|---|
+| Training Source 1 | **5,000 India + 5,000 US = 10,000 businesses** |
+| Training Source 2 / 3 positives | **Every known matching record** for those selected businesses |
+| Additional Source 2 / 3 distractors | Up to **5,000 per country in EACH reference source** |
+| Test Source 1 / 2 / 3 | Up to **5,000 per country per source**, including France |
 
-- `train/train_source1.tsv.gz`, `train/train_source2.tsv.gz`, `train/train_source3.tsv.gz`
-- `train/train_ground_truth.tsv`
-- For test preparation: `test/test_source1.tsv.gz`, `test/test_source2.tsv.gz`, `test/test_source3.tsv.gz`
+Reservoir sampling is uniform within each country and uses seed 42. If a source/country has fewer records than requested, all available records are retained; sampling never creates or duplicates records. Reference files therefore contain more than 10,000 records when all retained positives and distractors are combined. The original ZIP stays unchanged.
 
-The cleaner's additional columns are required. They are checked before indexing.
-
-## 2. Run the connected pipeline
-
-First run on your already-cleaned **small sample**, in a separate work folder:
+You can override the three counts independently:
 
 ```bash
-python run.py prepare --cleaned "cleaned_sample" --work "work_sample" --split train
-python run.py prepare --cleaned "cleaned_sample" --work "work_sample" --split test
+python make_er_sample.py --input "ML_Dataset.zip" --output "er_sample_5000.zip" --train-per-country 5000 --distractors-per-country 5000 --test-per-country 5000
 ```
 
-Then process the original cleaned challenge dataset:
+Choose a new output name if the ZIP already exists. A larger sample is useful for baseline training, but fewer reference distractors still make its validation optimistic. Independently sampled test files do not preserve every true match and **cannot produce a full challenge submission**.
+
+## 2. Run the COMPLETE sampled baseline
 
 ```bash
-python run.py prepare --cleaned "cleaned_data" --work "work_full" --split train
-python run.py prepare --cleaned "cleaned_data" --work "work_full" --split test
+python run.py baseline --input "er_sample_5000.zip" --work "work_5000" --threads 2
 ```
 
-In a notebook, prefix a command with `!`, for example:
+This single command:
 
-```python
-!python run.py prepare --cleaned "cleaned_data" --work "work_full" --split train
-```
+1. Cleans the sampled ZIP into `work_5000/cleaned/`.
+2. Builds train indexes, blocks, labels and pairwise features.
+3. Keeps all pairs for each S1 in one train/validation split.
+4. Trains LightGBM with early stopping.
+5. Scores **every validation candidate**, chooses a threshold using macro F₀.₅ over **every validation S1**, and saves the model.
+6. Prepares test candidates/features using the frozen training TF-IDF.
+7. Scores every test pair in batches and writes `matching_results.tsv` and `candidate_pairs.tsv`.
 
-These commands stop at feature tables. They do not train a model.
+No GPU or manual probability-file creation is required. In a notebook, prefix terminal commands with `!`.
 
-For a pilot against the **full reference pool**:
+If you already cleaned the larger sample, use:
 
 ```bash
-python run.py prepare --cleaned "cleaned_data" --work "work_pilot" --split train --max-queries 1000
+python run.py baseline --cleaned "cleaned_sample_5000" --work "work_5000" --threads 2
 ```
 
-`--max-queries` limits Source 1 only. Indexing still reads every Source 2/3 record so retrieval difficulty reflects the full pool. This is a smoke test of the first N S1 records, not a representative validation sample. Use a NEW work folder when removing the limit or changing the configuration.
-
-On rerun with the SAME command/config/input/code, completed stages are skipped. An interrupted stage restarts from its beginning; indexing is not resumed halfway through. Changed inputs/configuration/code require a new `--work` folder. Do not manually mix outputs from different runs.
-
-## 3. Modules in order
-
-| Order | Python module under `src/er_pipeline/` | Responsibility | Main artifact |
-|---|---|---|---|
-| 1 | `indexing.py` | Stream cleaned rows into SQLite; index S2/S3; fit training reference TF-IDF | `index.sqlite`, `tfidf.npz` |
-| 2 | `blocking.py` | A–F blocks, union, deduplication, ranking and final cap | `candidate_pairs.parquet`, `queries.tsv.gz` |
-| 3 | `labeling.py` | Join actual candidates to ground truth; assign S1-level split; measure recall | `labeled_pairs.parquet`, `candidate_recall.json` |
-| 4 | `features.py` | Compute your pairwise features with explicit missingness | `pair_features.parquet` |
-| 5 | `tables.py` | Export train/validation/test tables and exact final candidate lists | `train_features.parquet`, `validation_features.parquet`, `test_features.parquet` |
-| 6, later | **Your model — intentionally not included** | Fit classifier and calculate probabilities | Your probability file |
-| 7, later | `evaluation.py` | Tune threshold using per-S1 macro F₀.₅; format supplied test probabilities | `validation_f05.json`, `matching_results.tsv` |
-
-Supporting modules: `common.py` (streaming I/O/configuration), `text_features.py` (TF-IDF and text keys), `cli.py` (orchestration).
-
-You can run stages individually with the SAME options/work folder:
+To train and validate first, without processing test data:
 
 ```bash
-python run.py prepare --cleaned "cleaned_data" --work "work_full" --split train --stage index
-python run.py prepare --cleaned "cleaned_data" --work "work_full" --split train --stage block
-python run.py prepare --cleaned "cleaned_data" --work "work_full" --split train --stage label
-python run.py prepare --cleaned "cleaned_data" --work "work_full" --split train --stage features
-python run.py prepare --cleaned "cleaned_data" --work "work_full" --split train --stage export
+python run.py baseline --input "er_sample_5000.zip" --work "work_5000" --skip-test --threads 2
 ```
 
-Test runs skip labeling. They reuse `work_full/train/tfidf.npz`; they never refit TF-IDF on test text. Test retrieval still indexes test S2/S3 because those are the records being searched.
+Re-running the same command skips completed cleaning/preparation/training. Interrupted preparation stages restart from their beginning; interrupted training restarts training. A cleaning interruption requires a new work folder. Changing raw data, preparation configuration or code requires a new work folder. Changing only training settings can use a new `--model-dir`. This avoids silently mixing artifacts.
+
+### Actual challenge submission using ALL original test records
+
+For an initial model trained on your 10,000-S1 sample, but predictions covering the real test dataset:
+
+```bash
+python clean_er_data.py --input "ML_Dataset.zip" --output "cleaned_original"
+python run.py baseline --cleaned "work_5000/cleaned" --test-cleaned "cleaned_original" --work "work_submission" --threads 2
+```
+
+This trains the sampled baseline again in a fresh work folder and searches/predicts against **all original test sources**. Do not replace the sample test inputs inside an existing completed test run.
+
+For preparation and training from the full original training dataset too:
+
+```bash
+python run.py baseline --input "ML_Dataset.zip" --work "work_full" --threads 2
+```
+
+Full preparation can be very expensive. At a cap of 80 candidates, 2.2 million S1 queries can yield roughly 176 million pairs. The training-row limit below does not reduce indexing, feature-generation or full validation/test-scoring costs.
+
+## 3. Modules and individual commands
+
+| Order | Module | Purpose |
+|---|---|---|
+| 0 | `make_er_sample.py` | Optional 5,000-per-country sample with positive-match closure |
+| 1 | `clean_er_data.py` | Unicode-safe cleaning; preserve raw data and IDs |
+| 2 | `src/er_pipeline/indexing.py` | Disk-backed reference indexes and training TF-IDF |
+| 3 | `blocking.py` | A–F candidate union, ranking and configurable caps |
+| 4 | `labeling.py` | Ground-truth labels, S1-level split and recall audit |
+| 5 | `features.py`, `tables.py` | Pairwise features and model-ready tables |
+| 6 | **`modeling.py`** | **LightGBM fitting, early stopping, save/load and batched prediction** |
+| 7 | `evaluation.py` | Full-query macro F₀.₅ threshold selection and output formatting |
+| Orchestration | `baseline.py`, `cli.py` | Connect all stages |
+
+To run each main stage separately:
+
+```bash
+python clean_er_data.py --input "er_sample_5000.zip" --output "cleaned_5000"
+python run.py prepare --cleaned "cleaned_5000" --work "work_steps" --split train
+python run.py train --work "work_steps" --threads 2
+python run.py prepare --cleaned "cleaned_5000" --work "work_steps" --split test
+python run.py predict --work "work_steps" --split test
+python run.py submit --work "work_steps" --probabilities "work_steps/test/test_probabilities.parquet"
+```
+
+`train` automatically predicts all validation pairs and evaluates thresholds; `submit` automatically uses that model's saved threshold. For externally generated probabilities, provide `--threshold` explicitly.
+
+Preparation can also be selected module by module with `--stage index`, `block`, `label`, `features`, or `export`, in that order. `prepare` alone still stops at feature tables. Test preparation skips labeling and reuses the training TF-IDF.
+
+A full-reference retrieval pilot can use `prepare --max-queries 1000` in a separate work folder. This limits S1 queries only, not reference indexing; it is not a full-test submission.
 
 ## 4. The blocking mechanism
 
@@ -128,7 +135,7 @@ Candidate generation:
 1. Retrieve bounded candidates from each channel.
 2. Union and deduplicate by record ID. Identical text with different IDs remains separate.
 3. Rank by `0.55 × name cosine + 0.30 × address cosine + 0.10 × exact basic name + 0.01 × channel count`.
-4. Apply the configurable final cap. The result is the ACTUAL set passed to feature extraction and, later, your model.
+4. Apply the configurable final cap. The result is the ACTUAL set passed to feature extraction and the model.
 
 Missing similarities contribute zero **only to this retrieval ranking heuristic**. Their model feature values remain NaN, with missingness flags.
 
@@ -160,7 +167,7 @@ TF-IDF statistics use only training reference (S2/S3) text. They never use label
 
 ## 6. Pairwise features
 
-Use the exact `features` list in `feature_columns.json` when you train later. Exclude IDs, `dataset_split` and `label` from model inputs. `label` is your target.
+Use the exact `features` list in `feature_columns.json` for model training. Exclude IDs, `dataset_split` and `label` from model inputs. `label` is your target.
 
 | Features | Definition |
 |---|---|
@@ -186,94 +193,92 @@ TF-IDF uses word tokens plus within-word 3–5-grams, log term frequency `1 + lo
 
 Unicode is retained. Character grams do not translate Hindi/Tamil/etc. into Latin. Cross-script matches may require address evidence or a later multilingual retrieval channel. The cleaner's city/state/postal/house columns remain heuristic evidence. House-number disagreement never automatically rejects a match.
 
-## 7. Final outputs
+## 7. LightGBM settings and memory use
 
-Inside `work_full/train/`:
-
-- **`train_features.parquet`** — model training table with target `label`.
-- **`validation_features.parquet`** — held-out candidate-pair table with `label`.
-- `feature_columns.json` — exact model-input list.
-- `candidate_recall.json`, `blocking_report.json`, `tables_report.json` — quality and size checks.
-- `query_labels.tsv.gz` — full truth including singleton/zero-candidate queries.
-
-Inside `work_full/test/`:
-
-- **`test_features.parquet`** — same numerical inputs, no target.
-- **`candidate_pairs.tsv`** — challenge format: `source1_entity_id`, `candidate_entity_ids`; one row per S1, comma-separated IDs.
-
-The `.parquet` candidate file is one row per pair; the `.tsv` candidate file is one row per S1. Do not confuse these two representations.
-
-You do not need pandas for this pipeline. To inspect a few rows without loading a full table:
-
-```python
-import pyarrow.parquet as pq
-file = pq.ParquetFile('work_full/train/train_features.parquet')
-batch = next(file.iter_batches(batch_size=5))
-print(batch.to_pylist())
-```
-
-## 8. Later: probabilities, F₀.₅ and submission
-
-Your separately trained model must score **every row** of `validation_features.parquet` or `test_features.parquet`, preserving these keys. Save predictions as TSV (optionally gzipped) or Parquet:
-
-| source1_entity_id | candidate_entity_id | match_probability |
-|---|---|---|
-| S1-... | S2-... | 0.93 |
-| S1-... | S3-... | 0.14 |
-
-These are illustrative values only. No probability file is produced by preparation.
-
-Evaluate validation probabilities and compare thresholds:
+`lgbm_config.json` is the editable training configuration. `config.json` separately controls blocking/preparation. Pass them using `--training-config` and `--config` respectively.
 
 ```bash
-python run.py evaluate --work "work_full" --probabilities "validation_probabilities.tsv"
+python run.py train --work "work_5000" --training-config "lgbm_config.json" --model-dir "work_5000/model_v2"
 ```
 
-Or provide a custom grid:
+| Training setting | Default |
+|---|---:|
+| Objective / device | Binary classification / CPU |
+| Learning rate | 0.05 |
+| Maximum boosting rounds | 600 |
+| Early-stopping patience | 50 |
+| Leaves / minimum rows per leaf | 31 / 50 |
+| Maximum bins | 63 |
+| L2 regularization | 2.0 |
+| CPU threads | 4; use `--threads 2` on a small laptop |
+| Maximum training pairs | 1,000,000 |
+| Maximum early-stopping monitor pairs | 200,000 |
+| Read/prediction batch size | 20,000 |
+
+Training and early-stopping arrays use float32. When a table exceeds its cap, the loader takes a reproducible uniform sample of pair rows without replacement. It does not move rows between train and validation, rebalance classes or inject positives. The cap preserves class proportions in expectation; exact class counts are recorded in model metadata. **All validation pairs are still scored for final threshold selection**, including those outside the early-stopping monitor sample. Test pairs are never downsampled during prediction.
+
+The requested 10,000 training S1 records remain in preparation, with approximately 20% held out for validation. At an 80-candidate cap, that sample fits below the default one-million-training-pair limit, so all its generated training pairs are normally used.
+
+The loader bounds raw training arrays, but LightGBM requires extra memory for bins, trees and working buffers. This is not fully out-of-core training. If RAM is tight, lower `--max-train-pairs`, lower `max_early_stopping_pairs` in the training config, and use fewer threads. Indexes and feature tables still consume disk space.
+
+NaN features are passed directly to LightGBM; they are not filled with zero. IDs, labels and split names are excluded from model inputs. No class weighting is enabled by default. Predicted probabilities are binary-model outputs, not a guarantee of calibration on a different reference pool.
+
+Early stopping optimizes **binary log loss** on the validation monitor. After training, the saved best iteration scores the whole validation candidate table. A threshold grid is evaluated using the challenge's **macro F₀.₅**:
+
+`F0.5 = 5*TP / (5*TP + 4*FP + FN)` per Source 1, then averaged.
+
+Both truth and prediction empty → 1; true singleton with any predicted match → 0. Blocked-out positives and zero-candidate queries remain in the denominator. A threshold tie chooses the higher threshold. Validation is used for stopping and threshold selection, so this score is a tuning result, not an unbiased final-test estimate. The model is not automatically refit on held-out validation data after tuning.
+
+To try more thresholds after training:
 
 ```bash
-python run.py evaluate --work "work_full" --probabilities "validation_probabilities.tsv" --thresholds "0.7,0.8,0.85,0.9,0.95,0.98"
+python run.py evaluate --work "work_5000" --probabilities "work_5000/model/validation_probabilities.parquet" --thresholds "0.4,0.45,0.5,0.55,0.6,0.7,0.8,0.9,0.95,0.99"
 ```
 
-For each S1:
+This separate evaluation does not overwrite the threshold bound to the saved model. To use its new threshold, pass `submit --threshold YOUR_VALUE` explicitly or retrain with the revised grid in a new model directory.
 
-`F0.5 = 5*TP / (5*TP + 4*FP + FN)`.
+## 8. Outputs and submission checks
 
-Both truth and prediction empty → 1. Truth empty but prediction nonempty → 0. Average across **all validation S1**, including zero-candidate queries and true positives missed by blocking. This is not a global binary-pair F-score. The threshold selected on validation is a tuning result, not an unbiased final-test estimate.
+| File under your work folder | Contents |
+|---|---|
+| `model/lightgbm_model.txt` | Saved LightGBM model |
+| `model/model_metadata.json` | Feature order, settings, row counts, model hash, best iteration, selected threshold and validation score |
+| `model/validation_probabilities.parquet` | Every validation candidate probability |
+| `model/validation_f05.json` | Threshold scores for this model |
+| `model/feature_importance.tsv` | Gain/split feature importance |
+| `model/learning_curve.json` | Validation log-loss history |
+| `train/train_features.parquet`, `train/validation_features.parquet` | Labeled model tables |
+| `train/candidate_recall.json` | Retrieval recall and its oracle score ceiling |
+| `test/test_features.parquet` | Unlabeled test model inputs |
+| `test/test_probabilities.parquet` | Every test candidate probability |
+| **`test/matching_results.tsv`** | One row per indexed S1 with zero, one or multiple accepted matches |
+| **`test/candidate_pairs.tsv`** | The exact final candidate set scored by the model |
+| `baseline_result.json` | End-to-end result summary |
 
-After scoring test pairs, use your selected threshold (0.9 below is only an example):
+`feature_columns.json` records the exact feature list. `queries.tsv.gz` and `query_labels.tsv.gz` retain queries with no candidates. Model hashes/feature order and frozen TF-IDF are checked before loading/predicting. Formatting rejects missing, duplicate or unexpected probability rows and incomplete indexed test-query runs.
+
+Before real submission, validate both TSVs against the **ORIGINAL full test sources**, not the sampled test files:
 
 ```bash
-python run.py submit --work "work_full" --probabilities "test_probabilities.tsv" --threshold 0.9
+python utils/validate_submission.py --matching "work_submission/test/matching_results.tsv" --candidate "work_submission/test/candidate_pairs.tsv" --test-dir "dataset/test" --check-ids
 ```
 
-This creates `work_full/test/matching_results.tsv`. It permits zero, one or many matches, rejects missing/duplicate/unexpected probability rows, ensures matches come from actual candidates, and refuses incomplete test-query runs.
+`utils/validate_submission.py` comes from your official challenge resource bundle; adjust its path accordingly. Its optional ID check may require significant RAM on full reference files. Successful validation against a small sampled test folder proves only sample formatting.
 
-Run the official `utils/validate_submission.py` supplied with the challenge against `matching_results.tsv`, `candidate_pairs.tsv`, and the original test source files before uploading. This project supplies data preparation and formatting, not a trained submission model.
+## 9. Blocking controls and verification
 
-## 9. Resource controls and tests
+Default blocking settings in `config.json`: `max_candidates=80`, `block_limit=100`, `lexical_pool=120`, `lexical_top_k=25`, `query_terms=16`, `hash_bits=18`, `row_group_size=10000`, `sqlite_cache_mb=128`. Lower candidate caps reduce cost but may reduce recall. Defaults are starting values, not tuned competition optima.
 
-`config.json` contains the defaults. To customize, edit a copy and pass `--config your_config.json` consistently for every stage/split in that work folder.
+SQLite must include FTS5. Most standard Python builds include it; an unavailable extension raises `no such module: fts5` during indexing.
 
-| Setting | Default | Meaning |
-|---|---:|---|
-| `max_candidates` | 80 | Final maximum candidates per S1 |
-| `block_limit` | 100 | Maximum results per A–D channel |
-| `lexical_pool` | 120 | Indexed shortlist size for E/F before TF-IDF reranking |
-| `lexical_top_k` | 25 | Retained candidates per E/F channel |
-| `query_terms` | 16 | Rare lexical tokens used in each search |
-| `hash_bits` | 18 | TF-IDF dimension = 2^18 per field |
-| `row_group_size` | 10000 | Bounded buffered rows for Parquet output |
-| `sqlite_cache_mb` | 128 | Cache budget per SQLite connection |
-
-There is no all-pairs matrix and no full in-memory reference table. The index and intermediate/output tables still require substantial disk space and CPU time. Bounded RAM does not make millions of queries cheap: at 80 candidates, 2.2 million S1 records can create roughly **176 million pair rows**. Lower caps reduce cost but may reduce recall. Defaults are starting values, not competition-tuned optimums. Multiple intermediate tables are intentionally retained for auditing; plan disk space for them and the index. The full dataset has not been benchmarked on your machine.
-
-Run the included synthetic correctness tests:
+Run tests:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Tests cover connected stages, country separation, duplicate-looking IDs, oversized blocks, missing values, word reordering, missed positives, S1 split separation, singleton/zero-candidate metric behavior, and rejection of missing probability rows. `SAMPLE_VERIFICATION.md` records the actual uploaded-sample checks.
+Tests cover 5,000-per-country sampling, connected preparation, country restrictions, missing evidence, duplicate-looking record IDs, S1 split separation, actual LightGBM training/reload, deterministic capped loading, all-candidate probability coverage, empty prediction tables, feature/threshold consistency and macro F₀.₅ including missed positives.
 
-API references used for implementation: [SQLite FTS5](https://www.sqlite.org/fts5.html), [RapidFuzz Levenshtein](https://rapidfuzz.github.io/RapidFuzz/Usage/distance/Levenshtein.html), [RapidFuzz Jaro–Winkler](https://rapidfuzz.github.io/RapidFuzz/Usage/distance/JaroWinkler.html), [PyArrow ParquetWriter](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetWriter.html).
+`SAMPLE_VERIFICATION.md` records the original preparation checks and the subsequent end-to-end LightGBM smoke test. The full 1.01 GB dataset and new 10,000-S1 sample have not been run in this workspace because only the earlier small sample was uploaded.
+
+Official implementation references: [LightGBM 4.6 train](https://lightgbm.readthedocs.io/en/v4.6.0/pythonapi/lightgbm.train.html), [LightGBM Booster](https://lightgbm.readthedocs.io/en/v4.6.0/pythonapi/lightgbm.Booster.html), [SQLite FTS5](https://www.sqlite.org/fts5.html), [RapidFuzz distances](https://rapidfuzz.github.io/RapidFuzz/Usage/distance/Levenshtein.html), [PyArrow ParquetWriter](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetWriter.html).

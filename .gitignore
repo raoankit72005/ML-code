@@ -28,3 +28,11 @@ outputs/
 .ipynb_checkpoints/
 .DS_Store
 Thumbs.db
+
+# Trained models and predictions
+model/
+lightgbm_model.txt
+model_metadata.json
+*.bin
+*.pkl
+*.joblib

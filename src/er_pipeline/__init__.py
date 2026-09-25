@@ -1,1 +1,1 @@
-"""Pre-model business entity resolution pipeline."""
+"""Complete business entity resolution baseline with LightGBM."""
