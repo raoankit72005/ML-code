@@ -13,6 +13,9 @@ from . import modeling, evaluation
 def run(args):
     # Import here to avoid a CLI/baseline import cycle.
     from .cli import prepare, fingerprint, ensure_complete_test
+    cfg = modeling.load_config(args.training_config, dict(
+        num_boost_round=args.num_boost_round, num_threads=args.threads,
+        max_train_pairs=args.max_train_pairs))
     root = args.work.resolve()
     root.mkdir(parents=True, exist_ok=True)
     sample_test = None
@@ -44,9 +47,9 @@ def run(args):
             sample_test = any(source.rglob('SAMPLE_README.txt'))
     else:
         cleaned = args.cleaned.resolve()
-    cfg = modeling.load_config(args.training_config, dict(
-        num_boost_round=args.num_boost_round, num_threads=args.threads,
-        max_train_pairs=args.max_train_pairs))
+    report_path = cleaned/'cleaning_report.json'
+    if cfg['full_data'] and report_path.exists() and json.loads(report_path.read_text()).get('known_sample'):
+        raise ValueError('Full-data training refuses a known sampled dataset')
     prepare(argparse.Namespace(cleaned=cleaned, work=root, split='train',
         stage='all', config=args.config, max_queries=None))
     metadata = modeling.train(root, cfg, args.model_dir)

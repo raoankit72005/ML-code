@@ -36,3 +36,8 @@ model_metadata.json
 *.bin
 *.pkl
 *.joblib
+
+# Full-data staging and local run logs
+*.f32
+*.log
+resource_plan.json

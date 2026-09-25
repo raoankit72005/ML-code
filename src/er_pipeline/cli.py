@@ -36,6 +36,10 @@ def prepare(args):
     for k in config:
         if k == 'validation_fraction':
             continue
+        if k in ('word_retrieval', 'diverse_candidates'):
+            if type(config[k]) is not int or config[k] < 0:
+                raise ValueError(f'{k} must be an integer >= 0')
+            continue
         if not isinstance(config[k], int) or (k != 'seed' and config[k] <= 0):
             raise ValueError(f'{k} must be an integer' + ('' if k == 'seed' else ' > 0'))
     if not 12 <= config['hash_bits'] <= 22:
@@ -153,8 +157,51 @@ def main():
     b.add_argument('--config', type=Path, help='Blocking/preparation configuration')
     b.add_argument('--skip-test', action='store_true', help='Stop after training and validation')
     training_arguments(b)
+    full = commands.add_parser('full', help='Original dataset -> ALL training pairs -> CUDA -> complete test submission')
+    full.add_argument('--input', type=Path, required=True, help='ORIGINAL dataset ZIP or folder, never the sample')
+    full.add_argument('--work', type=Path, default=Path('work_full_gpu'))
+    full.add_argument('--skip-test', action='store_true')
+    full.add_argument('--config', type=Path, default=Path(__file__).resolve().parents[2]/'configs/full_preparation.json')
+    full.add_argument('--training-config', type=Path, default=Path(__file__).resolve().parents[2]/'configs/full_gpu.json')
+    doctor = commands.add_parser('doctor', help='Test CUDA build/device before preprocessing')
+    doctor.add_argument('--training-config', type=Path, default=Path(__file__).resolve().parents[2]/'configs/full_gpu.json')
+    estimate = commands.add_parser('estimate', help='Check prepared full-data RAM/VRAM requirements without training')
+    estimate.add_argument('--work', type=Path, required=True)
+    estimate.add_argument('--training-config', type=Path, default=Path(__file__).resolve().parents[2]/'configs/full_gpu.json')
+    audit = commands.add_parser('validate-submission', help='Verify every original test S1 appears in both submission files')
+    audit.add_argument('--work', type=Path, required=True)
+    audit.add_argument('--original', type=Path, required=True)
     args = parser.parse_args()
-    if args.command == 'prepare':
+    if args.command == 'full':
+        from . import modeling, resources, coverage
+        from .baseline import run
+        cfg = modeling.load_config(args.training_config)
+        if not cfg['full_data']:
+            raise ValueError('full requires full_data=true; no pair sampling is allowed')
+        with coverage.raw_source(args.input, 'train_source1.tsv') as records:
+            if next(iter(records), None) is None:
+                raise ValueError('Empty original training dataset')
+        resources.preflight(cfg)
+        args.cleaned = args.test_cleaned = args.model_dir = None
+        args.num_boost_round = args.threads = args.max_train_pairs = None
+        run(args)
+        if not args.skip_test:
+            coverage.validate(args.work, args.input)
+    elif args.command == 'doctor':
+        from . import modeling, resources
+        resources.preflight(modeling.load_config(args.training_config))
+    elif args.command == 'estimate':
+        from . import modeling, resources
+        import pyarrow.parquet as pq
+        work = args.work/'train'
+        cfg = modeling.load_config(args.training_config)
+        resources.training_plan(pq.ParquetFile(work/'train_features.parquet').metadata.num_rows,
+            pq.ParquetFile(work/'validation_features.parquet').metadata.num_rows,
+            len(modeling.feature_names(work)), cfg, args.work)
+    elif args.command == 'validate-submission':
+        from .coverage import validate
+        validate(args.work, args.original)
+    elif args.command == 'prepare':
         prepare(args)
     elif args.command == 'train':
         from . import modeling

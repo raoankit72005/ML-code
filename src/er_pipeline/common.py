@@ -13,7 +13,8 @@ import pyarrow.parquet as pq
 DEFAULTS = dict(hash_bits=18, validation_fraction=0.2, seed=42,
     block_limit=100, lexical_pool=120, lexical_top_k=25,
     max_candidates=80, query_terms=16, row_group_size=10000,
-    sqlite_cache_mb=128, progress_every=10000)
+    sqlite_cache_mb=128, progress_every=10000, india_retrieval_multiplier=1,
+    word_retrieval=1, diverse_candidates=8)
 PAIR_FIELDS = ['source1_entity_id', 'candidate_entity_id', 'candidate_source',
     'candidate_rank', 'retrieval_score', 'name_retrieval_cosine',
     'address_retrieval_cosine', 'block_A', 'block_B', 'block_C', 'block_D',
@@ -32,8 +33,8 @@ def rows(path):
         yield from csv.DictReader(f, delimiter='\t')
 
 
-def parquet_rows(path):
-    for batch in pq.ParquetFile(path).iter_batches(batch_size=4096):
+def parquet_rows(path, columns=None):
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=4096, columns=columns):
         yield from batch.to_pylist()
 
 
@@ -41,7 +42,9 @@ class ParquetSink:
     def __init__(self, path, schema, chunk=10000):
         self.path = Path(path)
         self.partial = self.path.with_name(self.path.name + '.partial')
-        self.schema, self.chunk, self.buffer = schema, chunk, []
+        from .resources import batch_rows, check_disk
+        check_disk(self.path.parent)
+        self.schema, self.chunk, self.buffer = schema, batch_rows(chunk, len(schema)), []
         self.writer = pq.ParquetWriter(self.partial, schema, compression='zstd')
     def append(self, row):
         self.buffer.append(row)
@@ -49,6 +52,8 @@ class ParquetSink:
             self.flush()
     def flush(self):
         if self.buffer:
+            from .resources import check_disk
+            check_disk(self.path.parent)
             self.writer.write_table(pa.Table.from_pylist(self.buffer, schema=self.schema))
             self.buffer.clear()
     def __enter__(self):

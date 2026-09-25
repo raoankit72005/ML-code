@@ -1,4 +1,4 @@
-"""CPU LightGBM baseline: bounded training arrays and streaming full-pool scoring."""
+"""CPU/CUDA LightGBM with full-data disk loading and streaming scoring."""
 import csv
 import gc
 import hashlib
@@ -16,6 +16,8 @@ from .common import dump_json
 from . import evaluation
 
 DEFAULT_TRAINING = dict(
+    full_data=False, device_type="cpu", gpu_device_id=0, ram_fraction=0.65,
+    gpu_memory_fraction=0.75, disk_reserve_gb=5, histogram_pool_size=256,
     seed=42, num_threads=4, num_boost_round=600, early_stopping_rounds=50,
     learning_rate=0.05, num_leaves=31, min_data_in_leaf=50, max_bin=63,
     feature_fraction=0.9, bagging_fraction=0.9, bagging_freq=1, lambda_l2=2.0,
@@ -53,6 +55,18 @@ def load_config(path=None, overrides=None):
     for key in positive_ints:
         if type(config[key]) is not int or config[key] <= 0:
             raise ValueError(f'{key} must be an integer > 0')
+    if type(config['full_data']) is not bool:
+        raise ValueError('full_data must be boolean')
+    if config['device_type'] not in ('cpu', 'cuda'):
+        raise ValueError('device_type must be cpu or cuda')
+    if type(config['gpu_device_id']) is not int or config['gpu_device_id'] < 0:
+        raise ValueError('gpu_device_id must be a nonnegative integer')
+    for key in ('ram_fraction', 'gpu_memory_fraction'):
+        if not 0 < config[key] <= 0.9:
+            raise ValueError(f'{key} must be in (0, 0.9]')
+    for key in ('disk_reserve_gb', 'histogram_pool_size'):
+        if not math.isfinite(config[key]) or config[key] <= 0:
+            raise ValueError(f'{key} must be positive and finite')
     if type(config['seed']) is not int or config['seed'] < 0:
         raise ValueError('seed must be a nonnegative integer')
     if type(config['bagging_freq']) is not int or config['bagging_freq'] < 0:
@@ -141,6 +155,8 @@ def _predict_file(booster, source, destination, names, batch_size, num_threads):
     source, destination = Path(source), Path(destination)
     if source.resolve() == destination.resolve():
         raise ValueError('Probability output cannot overwrite its input features')
+    from .resources import batch_rows, check_disk
+    batch_size = batch_rows(batch_size, len(names))
     file = pq.ParquetFile(source)
     if set(names + ['source1_entity_id', 'candidate_entity_id']) - set(file.schema_arrow.names):
         raise ValueError('Prediction table is missing model features or pair IDs')
@@ -156,6 +172,7 @@ def _predict_file(booster, source, destination, names, batch_size, num_threads):
                 batch.column(batch.schema.get_field_index('source1_entity_id')),
                 batch.column(batch.schema.get_field_index('candidate_entity_id')),
                 pa.array(probabilities, type=pa.float64())], schema=PROBABILITY_SCHEMA)
+            check_disk(destination.parent, output.nbytes)
             writer.write_table(output)
             count += batch.num_rows
     if count != file.metadata.num_rows:
@@ -174,7 +191,8 @@ def train(root, config, model_dir=None):
     validation = work / 'validation_features.parquet'
     signature = dict(config=config, inputs=[file_identity(p) for p in
         (source, validation, work/'query_labels.tsv.gz', work/'feature_columns.json')],
-        tfidf_sha256=sha256(work/'tfidf.npz'), code_sha256=sha256(__file__))
+        tfidf_sha256=sha256(work/'tfidf.npz'), code_sha256=sha256(__file__), loader_sha256=sha256(Path(__file__).with_name('disk_training.py')),
+        resources_sha256=sha256(Path(__file__).with_name('resources.py')))
     metadata_path = model_dir / 'model_metadata.json'
     if metadata_path.exists():
         existing = json.loads(metadata_path.read_text())
@@ -189,16 +207,31 @@ def train(root, config, model_dir=None):
             return existing
     else:
         dump_json(metadata_path, dict(status='running', signature=signature))
-    print('Loading bounded train and early-stopping arrays...', flush=True)
-    x, y, train_stats = load_training_rows(source, names, config['max_train_pairs'], config['seed'], 'train', config['batch_size'])
-    xv, yv, monitor_stats = load_training_rows(validation, names, config['max_early_stopping_pairs'], config['seed']+1, 'validation', config['batch_size'])
-    if len(np.unique(y)) != 2:
-        raise ValueError('Training selection needs both positives and negatives; increase sample/cap or check candidate labels')
+    from .resources import preflight, training_plan
+    from .disk_training import stage_all
+    preflight(config)
+    if config['full_data']:
+        plan = training_plan(pq.ParquetFile(source).metadata.num_rows,
+            pq.ParquetFile(validation).metadata.num_rows, len(names), config, model_dir)
+        print('Loading ALL train and holdout pairs through disk-backed Sequence...', flush=True)
+        x, y, train_stats = stage_all(source, names, 'train', model_dir/'data_cache',
+            plan['batch_size'], config['disk_reserve_gb'])
+        xv, yv, monitor_stats = stage_all(validation, names, 'validation', model_dir/'data_cache',
+            plan['batch_size'], config['disk_reserve_gb'])
+    else:
+        print('Loading explicitly capped baseline arrays...', flush=True)
+        x, y, train_stats = load_training_rows(source, names, config['max_train_pairs'], config['seed'], 'train', config['batch_size'])
+        xv, yv, monitor_stats = load_training_rows(validation, names, config['max_early_stopping_pairs'], config['seed']+1, 'validation', config['batch_size'])
+    if not train_stats['positive_pairs'] or not train_stats['negative_pairs']:
+        raise ValueError('Training needs both positive and negative pairs')
     params = {k: config[k] for k in ('learning_rate', 'num_leaves', 'min_data_in_leaf', 'max_bin',
         'feature_fraction', 'bagging_fraction', 'bagging_freq', 'lambda_l2', 'num_threads', 'seed')}
-    params.update(objective='binary', metric='binary_logloss', device_type='cpu',
-        deterministic=True, force_col_wise=True, verbosity=-1,
+    params.update(objective='binary', metric='binary_logloss', device_type=config['device_type'],
+        gpu_device_id=config['gpu_device_id'], histogram_pool_size=config['histogram_pool_size'],
+        verbosity=-1,
         data_random_seed=config['seed'], feature_fraction_seed=config['seed'], bagging_seed=config['seed'])
+    if config['device_type'] == 'cpu':
+        params.update(deterministic=True, force_col_wise=True)
     training_set = lgb.Dataset(x, label=y, feature_name=names, free_raw_data=True)
     validation_set = lgb.Dataset(xv, label=yv, reference=training_set, feature_name=names, free_raw_data=True)
     history = {}
@@ -219,7 +252,12 @@ def train(root, config, model_dir=None):
         data = zip(names, booster.feature_importance('gain', iteration=best_iteration),
                    booster.feature_importance('split', iteration=best_iteration))
         writer.writerows(sorted(data, key=lambda row: -row[1]))
-    del x, y, xv, yv, training_set, validation_set, booster
+    booster.free_dataset()
+    del training_set, validation_set
+    if config['full_data']:
+        x.close(); xv.close()
+        y._mmap.close(); yv._mmap.close()
+    del x, y, xv, yv, booster
     gc.collect()
     booster = lgb.Booster(model_file=str(model_path))
     probability_path = model_dir/'validation_probabilities.parquet'

@@ -250,7 +250,7 @@ def main():
         parser.error('Duplicate source filenames found; point --input to one dataset only.')
     def open_input(name):
         return archive.open(name) if archive else (source / name).open('rb')
-    report = {'input': str(source), 'files': {}, 'notes': [
+    report = {'input': str(source), 'known_sample': (any(Path(n).name == 'SAMPLE_README.txt' for n in entries) if archive else any(source.rglob('SAMPLE_README.txt'))), 'files': {}, 'notes': [
         'All original field values and rows retained; no deduplication.',
         'Component columns are heuristic candidates; empty means unknown.',
         'Load TSVs with dtype=str, keep_default_na=False to preserve IDs and postal zeros.',

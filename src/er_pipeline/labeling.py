@@ -37,7 +37,9 @@ def label(work, truth_path, config):
     refs.close()
     current, truth, group, hits = None, set(), None, 0
     with ParquetSink(work / 'labeled_pairs.parquet', LABEL_SCHEMA, config['row_group_size']) as sink:
-        for pair in parquet_rows(work / 'candidate_pairs.parquet'):
+        for pair_index, pair in enumerate(parquet_rows(work / 'candidate_pairs.parquet'), 1):
+            if pair_index % 100000 == 0:
+                conn.commit()
             sid = pair['source1_entity_id']
             if sid != current:
                 if current is not None:

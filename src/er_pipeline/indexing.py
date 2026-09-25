@@ -51,6 +51,8 @@ def build(cleaned, work, split, config):
                         tfidf.update(record)
                 count += 1
                 if count % 10000 == 0:
+                    from .resources import check_disk
+                    check_disk(work)
                     conn.commit()
                 if count % config['progress_every'] == 0:
                     print(f'index {split} S{source}: {count:,}', flush=True)

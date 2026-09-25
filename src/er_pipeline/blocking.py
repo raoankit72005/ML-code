@@ -36,6 +36,8 @@ def generate(work, tfidf_path, config, max_queries=None):
             if max_queries is not None and index >= max_queries:
                 break
             q = json.loads(payload)
+            multiplier = config['india_retrieval_multiplier'] if q['country_key'] == 'IN' else 1
+            limit = config['max_candidates'] * multiplier
             qname, qaddress = name_text(q), address_text(q)
             nv, av = tfidf.vector(qname, 'name'), tfidf.vector(qaddress, 'address')
             name_query = field_query('name_terms', tfidf.query_tokens(qname, 'name', config['query_terms']))
@@ -69,9 +71,19 @@ def generate(work, tfidf_path, config, max_queries=None):
             for channel, expression, score_index in [('E', name_query, 1), ('F', address_query, 2)]:
                 if not expression:
                     continue
-                pool = search(restrict(expression), config['lexical_pool'], True)
+                pool = search(restrict(expression), config['lexical_pool'] * multiplier, True)
                 ranked = sorted(pool, key=lambda rid: (-finite(score(rid)[score_index]), score(rid)[0]['entity_id']))
-                add(ranked[:config['lexical_top_k']], channel)
+                add(ranked[:config['lexical_top_k'] * multiplier], channel)
+            # Whole-word retrieval gets a separate budget so rare typo grams do
+            # not consume every search term. Reuses channel E/F provenance.
+            if config['word_retrieval']:
+                for channel, field, value, score_index in [('E','name_terms',qname,1), ('F','address_terms',qaddress,2)]:
+                    tokens = sorted(set(value.split()), key=lambda w: (-len(w),w))[:config['query_terms']]
+                    expression = field_query(field, [encoded('w:'+w) for w in tokens])
+                    if expression:
+                        pool = search(restrict(expression), config['lexical_pool'] * multiplier, True)
+                        pool.sort(key=lambda rid: (-finite(score(rid)[score_index]), score(rid)[0]['entity_id']))
+                        add(pool[:config['lexical_top_k'] * multiplier], channel)
             ranked = []
             for rid, channels in candidates.items():
                 r, nc, ac = score(rid)
@@ -79,7 +91,19 @@ def generate(work, tfidf_path, config, max_queries=None):
                 score_value = .55 * finite(nc) + .30 * finite(ac) + .10 * exact + .01 * len(channels)
                 ranked.append((score_value, r['entity_id'], rid, nc, ac, channels))
             ranked.sort(key=lambda item: (-item[0], item[1]))
-            selected = ranked[:config['max_candidates']]
+            # Reserve a small quota for strong name/address evidence independently.
+            # Otherwise name-heavy final ranking discards cross-script address matches.
+            quota = min(config['diverse_candidates'], limit // 3)
+            retained = {}
+            for component in (3,4):
+                for item in sorted(ranked, key=lambda x: (-finite(x[component]), x[1]))[:quota]:
+                    if finite(item[component]) > 0:
+                        retained[item[1]] = item
+            for item in ranked:
+                if len(retained) >= limit:
+                    break
+                retained[item[1]] = item
+            selected = sorted(retained.values(), key=lambda x: (-x[0],x[1]))
             for rank, (value, eid, rid, nc, ac, channels) in enumerate(selected, 1):
                 r = score(rid)[0]
                 row = dict(source1_entity_id=q['entity_id'], candidate_entity_id=eid,

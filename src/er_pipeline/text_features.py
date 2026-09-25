@@ -104,11 +104,15 @@ def block_keys(r):
             keys[channel].append(encoded(channel + '\x1f' + '\x1f'.join(values)))
     add('A', 'basic', r['name_basic'])
     add('A', 'core', name)
+    add('A', 'suffix_free', r['name_without_suffix'])
+    add('A', 'expanded', r['name_expanded'])
     add('A', 'sorted', ' '.join(sorted(name.split())))
     if len(prefix) == 3:
         add('B', prefix)
         add('D', house, prefix)
     add('C', 'postal', state, postal)
+    # Country restriction is applied by retrieval; state extraction can be absent.
+    add('C', 'postal_only', postal)
     if city:
         stop = {'road','street','avenue','lane','block','near','and','the'}
         for token in sorted(set(address_text(r).split()) - stop):

@@ -3,12 +3,14 @@ import math
 from functools import lru_cache
 
 import pyarrow as pa
+from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein, JaroWinkler
 
 from .common import connect, lookup, parquet_rows, ParquetSink, PAIR_SCHEMA, LABEL_SCHEMA, dump_json
-from .text_features import Tfidf, name_text, address_text, grams, cosine
+from .text_features import grams
 
 FEATURES = [
+    'name_token_sort_ratio', 'address_token_sort_ratio',
     'name_levenshtein_ratio', 'name_jaro_winkler', 'name_token_jaccard',
     'name_tfidf_cosine', 'name_char_ngram_similarity', 'name_exact',
     'name_without_suffix_similarity', 'name_expanded_similarity',
@@ -45,6 +47,8 @@ def pair_features(a, b, name_cosine, address_cosine):
     aa, ba = a['address_normalized'], b['address_normalized']
     name_sim, addr_sim = lev(an, bn), lev(aa, ba)
     f = dict(
+        name_token_sort_ratio=fuzz.token_sort_ratio(an,bn)/100 if an and bn else math.nan,
+        address_token_sort_ratio=fuzz.token_sort_ratio(aa,ba)/100 if aa and ba else math.nan,
         name_levenshtein_ratio=name_sim,
         name_jaro_winkler=JaroWinkler.normalized_similarity(an, bn) if an and bn else math.nan,
         name_token_jaccard=jaccard(set(an.split()), set(bn.split())),
@@ -77,25 +81,23 @@ def pair_features(a, b, name_cosine, address_cosine):
 
 
 def extract(work, tfidf_path, split, config):
-    tfidf = Tfidf.load(tfidf_path)
     conn = connect(work / 'index.sqlite', config['sqlite_cache_mb'], readonly=True)
     @lru_cache(maxsize=256)
     def reference(eid):
         r = lookup(conn, eid)
-        return r, tfidf.vector(name_text(r), 'name'), tfidf.vector(address_text(r), 'address')
+        return r
     schema = pa.schema(list(LABEL_SCHEMA if split == 'train' else PAIR_SCHEMA) +
                        [pa.field(k, pa.float32()) for k in FEATURES])
     source = work / ('labeled_pairs.parquet' if split == 'train' else 'candidate_pairs.parquet')
-    current, q, qn, qa, count = None, None, None, None, 0
+    current, q, count = None, None, 0
     with ParquetSink(work / 'pair_features.parquet', schema, config['row_group_size']) as sink:
         for pair in parquet_rows(source):
             sid = pair['source1_entity_id']
             if sid != current:
                 q = lookup(conn, sid)
-                qn, qa = tfidf.vector(name_text(q), 'name'), tfidf.vector(address_text(q), 'address')
                 current = sid
-            r, rn, ra = reference(pair['candidate_entity_id'])
-            f = pair_features(q, r, cosine(qn, rn), cosine(qa, ra))
+            r = reference(pair['candidate_entity_id'])
+            f = pair_features(q, r, pair['name_retrieval_cosine'], pair['address_retrieval_cosine'])
             sink.append(dict(pair, **f))
             count += 1
             if count % (config['progress_every'] * 10) == 0:
